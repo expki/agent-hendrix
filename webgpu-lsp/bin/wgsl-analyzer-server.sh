@@ -9,21 +9,30 @@
 #
 # Resolution order for the server binary:
 #   1. $WGSL_ANALYZER_PATH              (explicit override, if executable)
-#   2. cached prebuilt binary           (previously downloaded, this version)
-#   3. bundled submodule release build  (analyzer/target/release, if built)
-#   4. `wgsl-analyzer` on $PATH
-#   5. download the matching prebuilt binary from the upstream release
+#   2. fresh cached download            (fetched within the TTL, for this version)
+#   3. freshly downloaded prebuilt      (the primary path for a supported target)
+#   4. stale cached download            (offline fallback: refresh failed)
+#   5. bundled submodule release build  (analyzer/target/release, if built)
+#   6. `wgsl-analyzer` on $PATH
 #
-# Tier 5 means users don't need Rust/cargo: on first run the launcher fetches
-# the platform binary that upstream already publishes, mirroring wgsl-analyzer's
-# own editor bootstrap. `scripts/build-server.sh` stays as an offline fallback.
+# Tiers 2-3 mean users don't need Rust/cargo: the launcher fetches the platform
+# binary that upstream publishes, mirroring wgsl-analyzer's own editor bootstrap.
+# We track the rolling `nightly` release, so a cached copy is refreshed once it
+# ages past the TTL (tier 2 vs 3); tier 4 keeps things working offline.
+# `scripts/build-server.sh` stays as an offline build path (tier 5).
 #
 set -euo pipefail
 
-# Upstream release the vendored submodule is pinned to. Keep in sync with the
-# submodule commit (currently tag 2026-04-26).
-WA_VERSION="2026-04-26"
+# Upstream release channel for the prebuilt server. `nightly` is a rolling release
+# upstream rebuilds from `main`; the vendored submodule tracks the same nightly tag.
+# Override WA_VERSION with a dated tag (e.g. 2026-04-26) to pin to an immutable build.
+WA_VERSION="${WA_VERSION:-nightly}"
 WA_REPO="wgsl-analyzer/wgsl-analyzer"
+
+# A rolling tag (nightly) is mutable, so a cached copy is reused only until it ages
+# past this many hours, then re-fetched (falling back to the stale copy if offline).
+# Dated tags are immutable and never expire regardless of this value.
+WA_NIGHTLY_TTL_HOURS="${WA_NIGHTLY_TTL_HOURS:-24}"
 
 # CLAUDE_PLUGIN_ROOT is set by Claude Code; fall back to this script's parent
 # directory so the launcher also works when run directly.
@@ -62,6 +71,25 @@ detect_target() {
 
 cached_binary() { printf '%s/wgsl-analyzer-%s-%s' "${CACHE_DIR}" "${WA_VERSION}" "$1"; }
 
+# True when WA_VERSION is a rolling tag whose binary changes under a fixed name.
+is_moving_tag() { [ "${WA_VERSION}" = "nightly" ]; }
+
+# True if $1 is an executable cached binary we can still trust: dated tags never
+# expire; a moving tag is trusted only while younger than WA_NIGHTLY_TTL_HOURS.
+# On any inability to read the clock/mtime we treat it as fresh, so a flaky `stat`
+# never forces a needless re-download.
+cache_fresh() {
+  local file="$1" now mtime age ttl
+  [ -x "${file}" ] || return 1
+  is_moving_tag || return 0
+  ttl=$(( WA_NIGHTLY_TTL_HOURS * 3600 ))
+  now="$(date +%s 2>/dev/null)" || return 0
+  mtime="$(stat -c %Y "${file}" 2>/dev/null || stat -f %m "${file}" 2>/dev/null)" || return 0
+  [ -n "${mtime}" ] || return 0
+  age=$(( now - mtime ))
+  [ "${age}" -lt "${ttl}" ]
+}
+
 # Fetch + decompress the prebuilt binary into the cache. Echoes its path on
 # success (stdout); all progress goes to stderr.
 download_binary() {
@@ -87,21 +115,33 @@ download_binary() {
   gunzip -f "${gz}" || { rm -f "${gz}" "${dest}.download"; log "failed to decompress ${gz}"; return 1; }
   chmod +x "${dest}.download"
   mv -f "${dest}.download" "${dest}"
+  touch "${dest}" 2>/dev/null || true # stamp fetch time so the TTL measures from now
   printf '%s' "${dest}"
 }
 
 resolve_server() {
   local target cached bin
+  # 1. Explicit override always wins.
   if [ -n "${WGSL_ANALYZER_PATH:-}" ] && [ -x "${WGSL_ANALYZER_PATH}" ]; then
     printf '%s' "${WGSL_ANALYZER_PATH}"; return 0
   fi
   target="$(detect_target)"
   if [ -n "${target}" ]; then
     cached="$(cached_binary "${target}")"
-    if [ -x "${cached}" ]; then printf '%s' "${cached}"; return 0; fi
+    # 2. Reuse a cached copy while it is still fresh (immediate, no network).
+    if cache_fresh "${cached}"; then printf '%s' "${cached}"; return 0; fi
+    # 3. Otherwise fetch the latest (first run, or the nightly TTL has expired).
+    if bin="$(download_binary)"; then printf '%s' "${bin}"; return 0; fi
+    # 4. Refresh failed (offline/rate-limited): fall back to the stale cache.
+    if [ -x "${cached}" ]; then
+      log "refresh failed — using stale cached ${WA_VERSION} binary"
+      printf '%s' "${cached}"; return 0
+    fi
   fi
+  # 5-6. No prebuilt for this platform, or nothing cached: locally-built, then PATH.
   if [ -x "${BUILT}" ]; then printf '%s' "${BUILT}"; return 0; fi
   if command -v wgsl-analyzer >/dev/null 2>&1; then command -v wgsl-analyzer; return 0; fi
+  # Unsupported target with no cache still gets one download attempt for its error.
   if bin="$(download_binary)"; then printf '%s' "${bin}"; return 0; fi
   return 1
 }

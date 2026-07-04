@@ -1,7 +1,7 @@
 {
   "name": "webgpu-lsp",
-  "version": "1.0.0",
-  "description": "WGSL & WESL language server for Claude Code — diagnostics, go-to-definition, hover, find references, and rename for WebGPU shader development.",
+  "version": "1.1.0",
+  "description": "WGSL & WESL language server for Claude Code to help with WebGPU shader development.",
   "author": {
     "name": "expki",
     "email": "expki@vdh.dev"
