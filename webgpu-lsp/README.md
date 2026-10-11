@@ -12,7 +12,7 @@ edits. What's actually useful is the intersection of those with what upstream
 
 ## Features
 
-Verified end-to-end against nightly `0.12.395`:
+Verified end-to-end against nightly `0.12.513`:
 
 | # | `LSP` operation | Advertised | Result |
 | --- | --- | --- | --- |
